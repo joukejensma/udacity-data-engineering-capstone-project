@@ -17,6 +17,19 @@ Processing is done on an AWS EMR cluster.
 I have read in the sas data in the Udacity workspace, using the specified functionality.
 This sas data has been converted to parquet and has been copied to my s3://jjudacitydatalake/staging folder as i94_parquet data.
 
+# Responding to reviewer comments
+After my first submission I have gotten a few requests for clarification, such as:
 
+> But please provide information on the purpose of the final data model, such as How the users use this data model to get the tourism insights.
 
+I have added some extra information in the Notebook. The gist of it is that the processed star schema is written to S3. Users wanting to perform an analysis will be able to read in the parquet files on S3 and use the processed tables for their own analysis purposes. See the example below in the notebook for a query an analyst might run.
+
+An optional encouragement was added as well:
+> But I would encourage you to think a little more, for example, when the data was increased by 100x, do you store the data in the same way with Spark? 
+
+This question and others have been expanded upon in the Notebook (see Step 5, project write up).
+
+> But please provide the required justification about this schema, such as why the tables are linked in this way, what could be the index of each table, and what could be the example queries users will use.
+
+To gain insight I have added the database schema (using the dbdiagram.io tool, thanks for the suggestion!). I have normalized the tables in such a way that queries will run efficiently. An example query is given below in the Notebook.
 

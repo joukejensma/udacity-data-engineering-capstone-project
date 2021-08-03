@@ -44,7 +44,9 @@ def sasDateToDatetime(sasdate):
     """
     return None if sasdate == None else datetime.strptime('1960-01-01', "%Y-%m-%d") + timedelta(sasdate)
 
-def readParquet(displayName, listPaths):
+sasdate_udf = udf(sasDateToDatetime, t.DateType())
+
+def readMultipleParquet(displayName, listPaths):
     """
     Given a list of paths to parquet files, return Spark Dataframe for processing.
     Show displayName for output.
@@ -84,13 +86,20 @@ def checkNumberOfRows(actual_count, expected_count):
         raise ValueError(f"The number of records found is {actual_count}, differing from expected value {expected_count}")
 
 
-if __name__ == "__main__":
-    listImmStagingPaths = [f's3://{s3_bucket}/capstone/staging/i94_parquet/i94_apr16_sub.sas7bdat', f's3://{s3_bucket}/capstone/staging/i94_parquet/i94_may16_sub.sas7bdat']
-    immigration_staging = readParquet("Immigration staging data", listImmStagingPaths)
+def read_immigration_staging(listPaths):
+    """
+    Given a list of strings representing paths to sas data files stored in parquet format, read and transform the immmigration staging data and return the DataFrame.
+    """
     
-    # set up immigration data
-    sasdate_udf = udf(sasDateToDatetime, t.DateType())
-    imm = immigration_staging.\
+    spark.sparkContext.setJobGroup("Read", "Read raw immigration staging data")
+
+    raw_data = readMultipleParquet("Reading multiple parquet files", listPaths)
+
+    print(f"Number of raw rows read: {raw_data.count()}")
+    
+    spark.sparkContext.setJobGroup("Read", "Read and transform immigration staging data")
+    
+    final_data = raw_data.\
         withColumn('arrdate_dt', sasdate_udf('arrdate')).\
         withColumn('depdate_dt', sasdate_udf('depdate')).\
         withColumn('arrdate_dayofmonth', dayofmonth(col('arrdate_dt'))).\
@@ -104,20 +113,62 @@ if __name__ == "__main__":
         filter(col('i94visa') == 2).\
         withColumn('id_imm', monotonically_increasing_id())
 
-    temp_staging = readCsv("Temperature data", [f's3://{s3_bucket}/capstone/staging/temperature_data/GlobalLandTemperaturesByCity.csv'])
-
-    # set up temperature data
-    df_temp = temp_staging.\
-        filter(col('Country') == 'United States').\
-        select(to_date(col("dt"),"yyyy-MM-dd").alias("dt"), 'AverageTemperature', 'City', 'Country', 'Latitude', 'Longitude').\
-        withColumn('dayofmonth', dayofmonth(col('dt'))).\
-        withColumn('month', month(col('dt'))).\
-        withColumn('year', year(col('dt'))).\
-        withColumn("latitude_rounded", format_string("%.0f", regexp_extract(col('Latitude'), '\d+.\d+', 0).cast(t.DoubleType()))).\
-        withColumn("longitude_rounded", format_string("%.0f", regexp_extract(col('Longitude'), '\d+.\d+', 0).cast(t.DoubleType()))).\
-        dropna()
+    print(f"Number of rows in final selected dataset: {final_data.count()}")
     
-    df_temp.createOrReplaceTempView("tempdata_coord")
+    return raw_data, final_data
+
+def read_temperature_staging(listPaths):
+    """
+    Given a list of paths to csv files, read in the temperature data, run transform and return dataframe.
+    """
+
+    spark.sparkContext.setJobGroup("Read", "Read raw temperature staging data")
+    raw_data = spark.read.option("header", "true").csv(*listPaths)
+
+    spark.sparkContext.setJobGroup("Read", "Read and transform temperature staging data")
+    final_data = raw_data.\
+    filter(col('Country') == 'United States').\
+    select(to_date(col("dt"),"yyyy-MM-dd").alias("dt"), 'AverageTemperature', 'City', 'Country', 'Latitude', 'Longitude').\
+    withColumn('dayofmonth', dayofmonth(col('dt'))).\
+    withColumn('month', month(col('dt'))).\
+    withColumn('year', year(col('dt'))).\
+    withColumn("latitude_rounded", format_string("%.0f", regexp_extract(col('Latitude'), '\d+.\d+', 0).cast(t.DoubleType()))).\
+    withColumn("longitude_rounded", format_string("%.0f", regexp_extract(col('Longitude'), '\d+.\d+', 0).cast(t.DoubleType()))).\
+    dropna()
+    
+    return raw_data, final_data    
+
+def read_airport_codes_staging(listPaths):
+    """
+    Given a list of strings to airport code csv files, return the raw and final dataframes of airport codes.
+    """
+    
+    spark.sparkContext.setJobGroup("Read", "Read raw airport code staging data")
+    raw_data = spark.read.option("header", "true").csv(*listPaths)
+    
+    # coordinates are specified in [longitude, latitude]
+    coordinates_split = split(raw_data['coordinates'], ',')
+    region_split = split(raw_data['iso_region'], '-')
+
+    spark.sparkContext.setJobGroup("Read", "Read and transform airport code staging data")
+    final_data = raw_data.\
+                        filter(col('iso_country') == 'US').\
+                        withColumn("latitude", format_string("%.0f", abs(coordinates_split.getItem(1).cast(t.DoubleType())))).\
+                        withColumn("longitude", format_string("%.0f", abs(coordinates_split.getItem(0).cast(t.DoubleType())))).\
+                        withColumn("state", region_split.getItem(1)).\
+                        withColumn('state', when(~col('state').isin(valid_us_states), 'other').otherwise(col('state'))).\
+                        fillna('other', subset='state')
+    
+    return raw_data, final_data    
+
+def create_temperature_table():
+    """
+    Given two dataframes, airport_codes_final_data and temperature_final_data, join these on coordinates and return a dataframe
+    with columns day of month, month, state and the average temperature applicable
+    """
+    spark.sparkContext.setJobGroup("Transform", "Create temperature helper table")
+    
+    temperature_final_data.createOrReplaceTempView("tempdata_coord")
     temp_table = spark.sql("""
     select dayofmonth, month, latitude_rounded as lat, longitude_rounded as long, avg(AverageTemperature) as AvgTemp
     from tempdata_coord
@@ -125,24 +176,7 @@ if __name__ == "__main__":
     order by lat asc, long asc, month asc, dayofmonth asc
     """)
 
-    temp_table = temp_table.withColumn("id_temp_coord", monotonically_increasing_id())
-
-    # set up airport code data
-    airport_codes_staging = readCsv("Airport code data", [f's3://{s3_bucket}/capstone/staging/airportcodes_data/airport-codes_csv.csv'])
-
-    # coordinates are specified in [longitude, latitude]
-    coordinates_split = split(airport_codes_staging['coordinates'], ',')
-    region_split = split(airport_codes_staging['iso_region'], '-')
-
-    df_airportcodes = airport_codes_staging.\
-                        filter(col('iso_country') == 'US').\
-                        withColumn("latitude", format_string("%.0f", abs(coordinates_split.getItem(1).cast(t.DoubleType())))).\
-                        withColumn("longitude", format_string("%.0f", abs(coordinates_split.getItem(0).cast(t.DoubleType())))).\
-                        withColumn("state", region_split.getItem(1)).\
-                        withColumn('state', when(~col('state').isin(valid_us_states), 'other').otherwise(col('state'))).\
-                        fillna('other', subset='state')
-
-    df_airportcodes.createOrReplaceTempView("aircodes")
+    airport_codes_final_data.createOrReplaceTempView("aircodes")
     # count the number of states for each lat/long pair
     aircode_table1 = spark.sql("""
     select latitude, longitude, state, count(state) as num
@@ -151,6 +185,7 @@ if __name__ == "__main__":
     order by latitude, longitude, state
     """)
 
+    airport_codes_final_data.createOrReplaceTempView("aircodes")
     # determine the maximum count per lat/long pair
     aircode_table2 = spark.sql("""
     select latitude as lat, longitude as long, max(num) as maxPerLatLong from (
@@ -164,55 +199,165 @@ if __name__ == "__main__":
     """)
 
     # join both tables to get the state with the most counts for each lat/long pairs
-    aircode_table = aircode_table1.\
+    aircode_table3 = aircode_table1.\
         join(aircode_table2, [aircode_table1.latitude == aircode_table2.lat, aircode_table1.longitude == aircode_table2.long, aircode_table1.num == aircode_table2.maxPerLatLong]).\
-        drop('long', 'lat', 'num', 'maxPerLatLong').\
-        withColumn("id_state_coord", monotonically_increasing_id())
+        drop('long', 'lat', 'num', 'maxPerLatLong')
+
+    # finally, join both together on coordinates
+    state_temp = temp_table.join(aircode_table3, [temp_table.lat == aircode_table3.latitude, temp_table.long == aircode_table3.longitude])
+
+    state_temp.createOrReplaceTempView("state_temp")
+    state_temp2 = spark.sql("""
+    select dayofmonth, month, state, avg(AvgTemp) as avg_temp
+    from state_temp
+    group by dayofmonth, month, state
+    order by dayofmonth, month, state
+    """)
+    
+    state_temp2 = state_temp2.withColumn("id_temp", monotonically_increasing_id())
+    
+    return state_temp2
+
+def create_dim_state():
+    """
+    Arguments: none. Return state dataframe.
+    """
+    spark.sparkContext.setJobGroup("Read", "Read and transform dim_state")
+    
+    return immigration_final_data.\
+            select('state').\
+            distinct().\
+            withColumn("id_state", monotonically_increasing_id())
+    
+def create_dim_time():
+    """
+    Arguments: none. Return time dataframe.
+    """
+    spark.sparkContext.setJobGroup("Read", "Read and transform dim_time")
+    return immigration_final_data.\
+            select(col('arrdate_dt').alias('date'), col('arrdate_dayofmonth').alias('day_of_month'), col('arrdate_month').alias('month'), col('arrdate_year').alias('year')).\
+            distinct().\
+            withColumn("id_time", monotonically_increasing_id())
+    
+def create_dim_person():
+    """
+    Arguments: none. Return person dataframe.
+    """    
+    spark.sparkContext.setJobGroup("Read", "Read and transform dim_person")
+    return immigration_final_data.\
+            select('gender', 'biryear', 'id_imm').\
+            withColumn("id_person", monotonically_increasing_id())
+    
+def create_dim_ports():
+    """
+    Arguments: none. Return ports dataframe.
+    """    
+    spark.sparkContext.setJobGroup("Read", "Read and transform dim_ports")
+    return immigration_final_data.\
+            select('i94port').alias('port').\
+            distinct().\
+            withColumn("id_port", monotonically_increasing_id())
+    
+def create_dim_airlines():
+    """
+    Arguments: none. Return airline dataframe.
+    """    
+    spark.sparkContext.setJobGroup("Read", "Read and transform dim_airlines")
+    return immigration_final_data.\
+            select('airline').\
+            distinct().\
+            withColumn("id_airline", monotonically_increasing_id())
+    
+def create_fact_temp():
+    """
+    Arguments: none. Return temperature dataframe.
+    """    
+    spark.sparkContext.setJobGroup("Read", "Read and transform dim_temp")
+    
+    return state_temp
+
+def create_fact_imm():
+    """
+    Arguments: none. Return fact_imm dataframe.
+    """    
+    spark.sparkContext.setJobGroup("Read", "Read and transform fact_imm")
+    
+    # we specifically perform left joins. we could transition to inner joins but some of the tables incomplete due to lacking information in the temperature/airport code table.
+    return immigration_final_data.\
+            join(dim_time, [immigration_final_data.arrdate_dt == dim_time.date], "left").\
+            join(dim_airlines, [immigration_final_data.airline == dim_airlines.airline], "left").\
+            join(dim_ports, [immigration_final_data.i94port == dim_ports.i94port], "left").\
+            join(dim_state, [immigration_final_data.state == dim_state.state], "left").\
+            join(fact_temp, [immigration_final_data.arrdate_dayofmonth == fact_temp.dayofmonth, immigration_final_data.arrdate_month == fact_temp.month, immigration_final_data.state == fact_temp.state], "left").\
+            join(dim_person, [immigration_final_data.id_imm == dim_person.id_imm], "left").\
+            select(immigration_final_data.id_imm, dim_state.id_state, 'id_time', 'id_person', 'id_port', 'id_airline', 'id_temp')
+
+
+if __name__ == "__main__":
+    # set up immigration data
+    immigration_raw_data, immigration_final_data = read_immigration_staging([f's3://{s3_bucket}/capstone/staging/i94_parquet/i94_apr16_sub.sas7bdat', f's3://{s3_bucket}/capstone/staging/i94_parquet/i94_may16_sub.sas7bdat'])
+
+    # set up temperature data
+    temperature_raw_data, temperature_final_data = read_temperature_staging([f's3://{s3_bucket}/capstone/staging/temperature_data/GlobalLandTemperaturesByCity.csv'])
+
+    # set up airport code data
+    airport_codes_raw_data, airport_codes_final_data = read_airport_codes_staging([f's3://{s3_bucket}/capstone/staging/airportcodes_data/airport-codes_csv.csv'])
+
+    # create temperature table
+    state_temp = create_temperature_table()
 
     # set up dimension tables
-    dim_state_coord = aircode_table.persist()
+    dim_state = create_dim_state()
+    dim_state.persist()
+    dim_time = create_dim_time()
+    dim_time.persist()
+    dim_person = create_dim_person()
+    dim_person.persist()
+    dim_ports = create_dim_ports()
+    dim_ports.persist()
+    dim_airlines = create_dim_airlines()
+    dim_airlines.persist()
 
-    dim_temp_coord = temp_table.persist()
-
-    imm.createOrReplaceTempView("immdata")
-    dim_time = spark.sql("""
-    select distinct arrdate_dt as datetime, arrdate_dayofmonth as dayofmonth, arrdate_month as month, arrdate_year as year
-    from immdata
-    """).persist()
-
-    dim_imm = imm
-
-    # set up fact table
-    fact_imm = dim_imm.\
-        join(dim_time, [dim_imm.arrdate_dt == dim_time.datetime]).\
-        join(dim_temp_coord, [dim_imm.arrdate_dayofmonth == dim_temp_coord.dayofmonth, dim_imm.arrdate_month == dim_temp_coord.month]).\
-        join(dim_state_coord, [dim_temp_coord.lat == dim_state_coord.latitude, dim_temp_coord.long == dim_state_coord.longitude]).\
-        select('id_imm', 'id_state_coord', 'id_temp_coord', 'datetime').\
-        dropDuplicates()
+    # create fact tables
+    fact_temp = create_fact_temp()
+    fact_imm = create_fact_imm()
 
     # write out dimension/fact tables to s3
-    writeToS3('dim_state_coord', f"s3a://{s3_bucket}/capstone/processed/dim_state_coord", 'overwrite', 'parquet', dim_state_coord)
-    writeToS3('dim_temp_coord', f"s3a://{s3_bucket}/capstone/processed/dim_temp_coord", 'overwrite', 'parquet', dim_temp_coord)
+    writeToS3('dim_state', f"s3a://{s3_bucket}/capstone/processed/dim_state", 'overwrite', 'parquet', dim_state)
     writeToS3('dim_time', f"s3a://{s3_bucket}/capstone/processed/dim_time", 'overwrite', 'parquet', dim_time)
-    writeToS3('dim_imm', f"s3a://{s3_bucket}/capstone/processed/dim_imm", 'overwrite', 'parquet', dim_imm)
+    writeToS3('dim_person', f"s3a://{s3_bucket}/capstone/processed/dim_person", 'overwrite', 'parquet', dim_person)
+    writeToS3('dim_airlines', f"s3a://{s3_bucket}/capstone/processed/dim_airlines", 'overwrite', 'parquet', dim_airlines)
+    writeToS3('dim_ports', f"s3a://{s3_bucket}/capstone/processed/dim_ports", 'overwrite', 'parquet', dim_ports)
+
     writeToS3('fact_imm', f"s3a://{s3_bucket}/capstone/processed/fact_imm", 'overwrite', 'parquet', fact_imm)
+    writeToS3('fact_temp', f"s3a://{s3_bucket}/capstone/processed/fact_temp", 'overwrite', 'parquet', fact_temp)
 
     # perform data quality checks
     spark.sparkContext.setJobGroup("DataQuality", "Counting number of records in tables")
-
-    expectedRowCount = {dim_state_coord : 1200, dim_temp_coord : 1164, dim_time : 61, dim_imm : 5388905, fact_imm : 17445547}
+    
+    expectedRowCount = {dim_state : 52, 
+                        fact_temp : 444, 
+                        dim_time : 61, 
+                        fact_imm : 5388905,
+                        dim_airlines : 622,
+                        dim_person : 5388905,
+                        dim_ports : 314,}
                             
-    for obj in [dim_state_coord, dim_temp_coord, dim_time, dim_imm, fact_imm]:
+    for obj in [dim_state, fact_temp, dim_time, fact_imm, dim_airlines, dim_person, dim_ports]:
+        print(f"Evaluating {obj}")
+        logging.info(f"Evaluating {obj}")        
         numRows = recordCount(obj)
         
         checkNumberOfRows(numRows, expectedRowCount[obj])
 
     spark.sparkContext.setJobGroup("DataQuality", "Counting total number of distinct states")
+    dim_state.createOrReplaceTempView("state")
     numDistinctStates = spark.sql("""
     select count(distinct state) 
-    from immdata
+    from state
     """)
 
     checkNumberOfRows(numDistinctStates.collect()[0]['count(DISTINCT state)'], len(valid_us_states) + 1)
 
+    # and finally, close spark nicely
     spark.stop()

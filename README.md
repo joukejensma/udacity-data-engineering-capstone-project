@@ -33,3 +33,4 @@ This question and others have been expanded upon in the Notebook (see Step 5, pr
 
 To gain insight I have added the database schema (using the dbdiagram.io tool, thanks for the suggestion!). I have normalized the tables in such a way that queries will run efficiently. An example query is given below in the Notebook.
 
+Lastly, I've reworked etl.py to be more modular (more functionality implemented in functions).
